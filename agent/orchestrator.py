@@ -17,7 +17,7 @@ async def call_tool(session, name, args):
         result = await session.call_tool(name, args)
         texts = [item.text for item in result.content if hasattr(item, "text")]
         return "\n".join(texts)
-    except Exception as e:
+    except (Exception, ExceptionGroup) as e:
         return f"[工具调用出错] {name}: {e}"
 
 
@@ -37,7 +37,7 @@ async def enhance_output(llm_client, raw_output: str, task_desc: str) -> str:
             temperature=0.3, max_tokens=1000,
         )
         return resp.choices[0].message.content.strip()
-    except Exception:
+    except (Exception, ExceptionGroup):
         return raw_output  # fallback to raw
 
 
@@ -53,7 +53,7 @@ async def llm_translate(llm_client, text: str, target: str = "中文") -> str:
             temperature=0.1, max_tokens=2000,
         )
         return resp.choices[0].message.content.strip()
-    except Exception as e:
+    except (Exception, ExceptionGroup) as e:
         return f"[翻译失败: {e}]"
 
 
@@ -123,7 +123,7 @@ async def handle_command(session, cmd):
     return True
 
 
-async def handle_llm(session, user_input):
+async def handle_llm(session, user_input, context):
     if user_input.lower() in ("exit", "quit"):
         print("再见！")
         return False
@@ -133,23 +133,52 @@ async def handle_llm(session, user_input):
     tools_desc = "\n".join(f"- {t.name}: {t.description}" for t in tools_info.tools)
 
     # Step 1: Parse intent
-    intent_prompt = f"""根据用户请求，选择要调用的工具。
+    intent_prompt = f"""你是一个工具调度助手。根据用户请求，从可用工具中选择一个并正确传参。
 
 可用工具:
 {tools_desc}
 
-用户: {user_input}
+回复格式：仅输出 JSON，不要任何其他文字。
+{{
+  "tool": "工具名称，不需要工具时为 null",
+  "args": {{ "参数名": "参数值" }},
+  "response": "不需要调工具时直接回复用户的话，否则为 null",
+  "next": "如果用户要求多步操作，描述下一步要做什么"
+}}
 
-回复格式（仅 JSON，不要其他文字）:
-{{"tool": "工具名或 null", "args": {{"参数": "值"}}, "response": "不需要工具时直接回复的内容", "next": "如果有下一步操作，描述一下"}}
+示例：
+用户: 帮我读一下 docs/report.pdf
+回复: {{"tool": "read_file", "args": {{"path": "docs/report.pdf"}}, "response": null, "next": ""}}
+
+用户: 你好，在吗？
+回复: {{"tool": null, "args": {{}}, "response": "你好！我可以帮你读 PDF/PPTX、翻译、解析、总结文档、导出笔记。你想处理哪个文件？", "next": ""}}
+
+用户: 把这段翻译成中文：File system manages data
+回复: {{"tool": "translate_text", "args": {{"text": "File system manages data", "target": "zh-CN"}}, "response": null, "next": ""}}
+
+用户: 处理 docs/xxx.pdf，逐页解析前3页，总结全文
+回复: {{"tool": "parse_document", "args": {{"path": "docs/xxx.pdf", "page_start": 1, "page_end": 3}}, "response": null, "next": "解析完成后调用 summarize_file 总结全文"}}
+
+用户: 总结这个文件然后导出
+回复: {{"tool": "summarize_file", "args": {{"path": ""}}, "response": "请提供文件路径", "next": ""}}
+
+用户: 把分析结果导出为笔记，标题叫"文件系统总结"，内容包含原文摘要和总结
+回复: {{"tool": "export_note_tool", "args": {{"title": "文件系统总结", "sections_json": "[{{\"heading\": \"原文摘要\", \"body\": \"内容\"}}, {{\"heading\": \"总结\", \"body\": \"内容\"}}]", "output_dir": "output"}}, "response": null, "next": ""}}
 
 注意：
+- export_note_tool 的参数是 title（标题）和 sections_json（JSON 字符串），不是 path
+- sections_json 格式: [{{"heading":"标题","body":"正文"}}]
 - read_file 的 path 参数是文件路径
 - translate_text 的 target 默认 "zh-CN"
 - export_note_tool 的 sections_json 格式: [{{"heading":"标题","body":"内容"}}]
-- 如果用户要求多个操作，先做第一个，回复里通过 next 描述剩下的
-- 如果请求中没有给出文件路径，response 里提示需要路径
-"""
+- 文件路径可以是绝对路径或相对于工作目录的相对路径
+
+上一步上下文：{context.get('next','')}
+上一步文件：{context.get('last_file','')}
+
+现在轮到你了：
+用户: {user_input}
+回复:"""
 
     try:
         resp = await llm_client.chat.completions.create(
@@ -158,10 +187,10 @@ async def handle_llm(session, user_input):
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": intent_prompt},
             ],
-            temperature=0.1, max_tokens=500,
+            temperature=0.1, max_tokens=800,
         )
         reply = resp.choices[0].message.content.strip()
-    except Exception as e:
+    except (Exception, ExceptionGroup) as e:
         print(f"[LLM 调用失败: {e}]")
         return await handle_command(session, user_input)
 
@@ -174,8 +203,22 @@ async def handle_llm(session, user_input):
     try:
         decision = json.loads(json_str.strip())
     except (json.JSONDecodeError, IndexError):
-        print(reply)
-        return True
+        # JSON 解析失败，尝试让 LLM 重试（只输出 JSON）
+        retry_prompt = f"请只输出 JSON，不要其他文字：\n用户请求：{user_input}\n可用工具：\n{tools_desc}"
+        try:
+            resp2 = await llm_client.chat.completions.create(
+                model=llm_utils.DEFAULT_MODEL,
+                messages=[{"role": "user", "content": retry_prompt}],
+                temperature=0.1, max_tokens=300,
+            )
+            reply2 = resp2.choices[0].message.content.strip()
+            if "```json" in reply2: reply2 = reply2.split("```json")[1].split("```")[0]
+            elif "```" in reply2: reply2 = reply2.split("```")[1].split("```")[0]
+            decision = json.loads(reply2.strip())
+        except (Exception, ExceptionGroup):
+            print(reply)
+            print("\n[无法解析指令，请换一种说法再试]")
+            return True
 
     tool_name = decision.get("tool")
     tool_args = decision.get("args", {})
@@ -196,6 +239,7 @@ async def handle_llm(session, user_input):
 
     if has_error:
         print(raw_result)
+        context["next"] = ""
         return True
 
     # Step 3: Enhance with LLM if applicable
@@ -211,7 +255,37 @@ async def handle_llm(session, user_input):
     else:
         print(raw_result)
 
-    # Step 4: Suggest next steps
+    # Step 4: Update context
+    if tool_name in ("read_file", "parse_document", "summarize_file", "translate_text"):
+        context["last_file"] = tool_args.get("path", tool_args.get("text", ""))
+        context["last_tool"] = tool_name
+    context["next"] = next_task
+    # Store results for auto-export
+    if tool_name == "parse_document":
+        context["last_parse"] = enhanced
+    elif tool_name == "summarize_file":
+        context["last_summary"] = enhanced
+        context["last_file_name"] = os.path.basename(context.get("last_file", ""))
+
+    # Auto-export after summarize if next step mentions export
+    if tool_name == "summarize_file" and next_task and "export" in next_task.lower():
+        fn = context.get("last_file_name", "文档")
+        sm = context.get("last_summary", "")
+        sections = json.dumps([
+            {"heading": "原文信息", "body": f"文件: {fn}"},
+            {"heading": "全文总结", "body": sm[:3000]},
+        ], ensure_ascii=False)
+        r = await call_tool(session, "export_note_tool", {
+            "title": fn + " - 分析报告",
+            "sections_json": sections,
+            "output_dir": "output"
+        })
+        print(f"\n📝 笔记已自动导出：{r}")
+        context["next"] = ""
+        print("\n全部完成！你可以输入新的需求。")
+        return True
+
+    # Step 5: Suggest next steps
     if next_task:
         print(f"\n下一步：{next_task}")
         print("直接告诉我继续处理，或者输入你的需求。")
@@ -242,6 +316,9 @@ async def main():
                 await session.initialize()
                 print("✅ MCP 服务器已连接\n")
 
+                # 对话上下文（记住上一步做了什么）
+                ctx = {"next": "", "last_file": "", "last_tool": ""}
+
                 while True:
                     try:
                         inp = input("> ").strip()
@@ -252,15 +329,23 @@ async def main():
                         continue
 
                     if llm_ok:
-                        cont = await handle_llm(session, inp)
+                        cont = await handle_llm(session, inp, ctx)
                     else:
                         cont = await handle_command(session, inp)
                     if not cont:
                         break
     except FileNotFoundError:
         print(f"[错误] 找不到服务器脚本: {server_path}")
-    except Exception as e:
-        print(f"[错误] {e}")
+    except (Exception, ExceptionGroup) as e:
+        from traceback import print_exc
+        print("[错误] MCP 连接异常，详情：")
+        if isinstance(e, ExceptionGroup):
+            for i, exc in enumerate(e.exceptions):
+                print(f"  [{i}] {exc}")
+                print_exc(type(exc), exc, exc.__traceback__)
+        else:
+            print(f"  {e}")
+            print_exc()
 
 
 if __name__ == "__main__":
