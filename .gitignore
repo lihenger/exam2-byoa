@@ -1,0 +1,19 @@
+# Environment variables
+.env
+.env.local
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Output files
+output/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Generated reports and output
+*.docx
+output/
